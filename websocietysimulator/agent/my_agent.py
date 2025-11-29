@@ -7,6 +7,7 @@ from websocietysimulator.agent.modules.memory_modules import MemoryDILU
 import json
 import re
 
+
 class MyPlanner(PlanningBase):
     """
     Track1 8-step planner, can be extended or modified later
@@ -113,75 +114,103 @@ class MyPlanner(PlanningBase):
 
 
 class PersonaBuilder:
-    """
-    Organized persona builder for stability, JSON accuracy, and minimal hallucination.
-    """
-
     def __init__(self, llm):
         self.llm = llm
 
+    def _detect_platform(self, item_info):
+        """Detect platform from item_info.source / item_source."""
+        try:
+            src = ""
+            if isinstance(item_info, dict):
+                src = item_info.get("source") or item_info.get("item_source") or ""
+            else:
+                src = str(item_info or "")
+            s = str(src).lower()
+            if "amazon" in s:
+                return "amazon"
+            if "yelp" in s:
+                return "yelp"
+            if "goodreads" in s or "good reads" in s:
+                return "goodreads"
+        except Exception:
+            pass
+        return "unknown"
+
     def build(self, user_profile, user_reviews, item_info=None):
 
+        platform = self._detect_platform(item_info)
+
         prompt = f"""
-IMPORTANT:
-- Output MUST be ONLY valid JSON.
-- No explanation. No comments. No quotes outside JSON. No markdown.
-- If unsure, estimate based on available evidence. Leave no field empty.
+Return ONLY valid JSON. First character must be '{{'.
+No comments, no markdown, no explanation.
 
-You analyze a user's behavior to construct a structured persona.
+Use ONLY these inputs:
+PLATFORM: {platform}
+PROFILE: {user_profile}
+REVIEWS: {user_reviews}
+ITEM INFO: {item_info}
 
-===========================
-INPUT: USER PROFILE
-===========================
-{user_profile}
+================ RULES ================
 
-===========================
-INPUT: USER REVIEW HISTORY
-===========================
-{user_reviews}
+[1] Writing Style realism
+- MUST reflect real user_reviews behavior.
+- If reviews are short → persona must be short.
+- If factual → tone must be factual.
+- No invented emotions, no exaggerated positivity.
 
-===========================
-INPUT: ITEM INFORMATION
-===========================
-{item_info}
+[2] Rating Behavior (STRICT deterministic rules)
+Compute avg rating from user_reviews:
+- avg < 3.2 → "harsh"
+- 3.2–4.0 → "neutral"
+- avg > 4.0 → "generous"
+Do NOT infer tendency from tone.
 
-===========================
-YOUR TASK
-===========================
-Infer a complete persona along six dimensions using ONLY information from the profile,
-review history, and item domain.
+[3] Domain + platform detection (for domain_expertise.current_domain)
 
-===========================
-WRITING STYLE REALISM RULES
-===========================
-User writing style MUST reflect actual review history:
-- If the user's reviews are short, neutral, or factual, the persona MUST reflect that.
-- Avoid assuming enthusiasm or emotional positivity unless strongly supported by history.
-- Do NOT invent emotional intensity, personal stories, or exaggerated tone.
+- First, consider PLATFORM field:
+    * amazon   → product-oriented
+    * yelp     → local business / service / restaurant / hotel
+    * goodreads→ books / novels / literature
+    * unknown  → generic
 
-===========================
-RATING BEHAVIOR RULES (CRITICAL)
-===========================
-Infer rating behavior STRICTLY from the user's historical star ratings:
+- Then choose one domain label and justify in evidence:
 
-- Compute the average rating from user_reviews.
-- If avg_rating < 3.2 → tendency = "harsh"
-- If 3.2 ≤ avg_rating ≤ 4.0 → tendency = "neutral"
-- If avg_rating > 4.0 → tendency = "generous"
+For AMAZON-like products, typical domains:
+  "video_games"             ← game, ps5, xbox, switch, steam, controller
+  "musical_instruments"     ← guitar, piano, violin, strings, tone, amp, pedal
+  "electronics"             ← mouse, keyboard, monitor, battery, charger, usb, cable
+  "industrial_scientific"   ← measurement, precision, lab, sensor, gauge, calibration
+  "generic_product"         ← anything else product-like
 
-Do NOT infer tendency from writing tone or personality.
-Do NOT assume users are positive by default.
+For YELP-like local businesses:
+  "restaurant"              ← restaurant, food, dish, menu, brunch, dinner, lunch, cafe, bar, server, waiter, service
+  "hotel"                   ← hotel, room, stay, front desk, check-in, lobby, housekeeping
+  "local_service"           ← salon, dentist, doctor, clinic, repair, auto, mechanic, cleaning, staff, appointment
+  "generic_business"        ← business / place but not clearly above
 
+For GOODREADS-like books:
+  "fiction_book"            ← novel, fantasy, romance, thriller, character, plot, story, series
+  "nonfiction_book"         ← biography, memoir, history, science, philosophy, self-help
+  "generic_media"           ← cannot tell but clearly about reading / books
 
-Produce a JSON dict with EXACTLY these fields:
+If nothing fits clearly, use a safe generic label:
+  "generic"                 ← insufficient information
 
+[4] Expertise rule (domain_expertise.expertise_level):
+- "expert"       = frequent technical or domain-specific terms
+- "intermediate" = occasional technical terms or informed comments
+- "novice"       = simple language, focuses on ease-of-use
+- "none"         = no domain signals in the reviews
+
+================ OUTPUT SCHEMA ================
 {{
   "writing_style": {{
     "tone": "",
     "punctuation": "",
     "filler_words": [],
     "sentence_length": "short/medium/long",
-    "detail_level": "low/medium/high"
+    "detail_level": "low/medium/high",
+    "review_length": "short/medium/long"
   }},
   "rating_behavior": {{
     "tendency": "generous/neutral/harsh",
@@ -212,44 +241,28 @@ Produce a JSON dict with EXACTLY these fields:
     "evidence": ""
   }}
 }}
-
-===========================
-DOMAIN DETECTION RULES
-===========================
-If item_info contains keywords:
-- video_games → ["game", "ps5", "xbox", "switch", "steam", "controller"]
-- musical_instruments → ["guitar", "piano", "violin", "strings", "tone"]
-- electronics → ["mouse", "keyboard", "monitor", "battery", "charger"]
-- industrial_scientific → ["measurement", "precision", "lab", "sensor"]
-Else domain = "generic"
-
-===========================
-EXPERTISE RULES
-===========================
-expert:
-  - frequent domain-specific keywords OR consistent technical vocabulary
-intermediate:
-  - occasional technical terms OR domain-informed comments
-novice:
-  - simple language, focuses on ease-of-use
-none:
-  - no domain evidence
-
-Remember:
-- MUST produce complete JSON.
-- MUST not add any text outside JSON.
 """
-
         res = self.llm(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=700
+            max_tokens=650,
         )
 
+        return self._safe_json(res)
+
+    def _safe_json(self, text):
+        import json, re
+
+        text = text.strip()
+        text = text[text.find("{"): text.rfind("}") + 1]
+
+        text = re.sub(r",\s*}", "}", text)
+        text = re.sub(r",\s*]", "]", text)
+
         try:
-            return json.loads(res)
+            return json.loads(text)
         except Exception:
-            return {"raw": res}
+            return {"raw": text}
 
 
 class MyReasoner(ReasoningIO):
@@ -262,7 +275,7 @@ class MyReasoner(ReasoningIO):
 
     def _extract_results(self, text: str):
         """
-        Extract stars and
+        Extract stars and review
         """
         stars_match = re.search(r"stars:\s*([0-9.]+)", text)
         review_match = re.search(r"review:\s*(.*)", text, re.DOTALL)
@@ -278,6 +291,25 @@ class MyReasoner(ReasoningIO):
         review = review_match.group(1).strip()[:512]
 
         return {"stars": stars, "review": review}
+
+    def _detect_platform(self, item_info):
+        """Same heuristic as PersonaBuilder, kept本地化."""
+        try:
+            src = ""
+            if isinstance(item_info, dict):
+                src = item_info.get("source") or item_info.get("item_source") or ""
+            else:
+                src = str(item_info or "")
+            s = str(src).lower()
+            if "amazon" in s:
+                return "amazon"
+            if "yelp" in s:
+                return "yelp"
+            if "goodreads" in s or "good reads" in s:
+                return "goodreads"
+        except Exception:
+            pass
+        return "unknown"
 
     def generate_review(self, persona_json, user_profile, item_info, similar_reviews):
         """
@@ -298,49 +330,68 @@ class MyReasoner(ReasoningIO):
         domain = domain_info.get("current_domain", "generic")
         expertise = domain_info.get("expertise_level", "none")
 
-        prompt = f"""
-You are simulating a human Amazon user writing a product review.
+        platform = self._detect_platform(item_info)
 
-================ USER PERSONA ================
+        prompt = f"""
+You are simulating a real user writing a review on an online platform 
+(e.g., Amazon, Yelp, Goodreads). Stay faithful to the persona and platform.
+
+RETURN FORMAT (must follow EXACTLY):
+stars: <1–5 rating>
+review: <text>
+
+================ PLATFORM =======================
+{platform}
+
+================ PERSONA (JSON) ================
 {json.dumps(persona_json, indent=2)}
 
-================ USER PROFILE ================
+================ PROFILE ========================
 {user_profile}
 
-================ PRODUCT INFORMATION ================
+================ ITEM INFO ======================
 {item_info}
 
-================ SIMILAR REVIEWS (USER HISTORY / ITEM CONTEXT) ================
+================ CONTEXT REVIEWS ================
 {similar_reviews}
 
-================ DOMAIN DETECTED ================
+================ DOMAIN =========================
 {domain}
 
-================ USER EXPERTISE ================
+================ EXPERTISE LEVEL ===============
 {expertise}
 
-Write a review consistent with the user's persona AND their expertise level.
+================ WRITING RULES ==================
+- Review must match persona: tone, punctuation, filler words, detail level, logic style.
+- Length: Write a review whose length matches the user's past writing style:
+    - If review_length = "short": 1–2 sentences
+    - If review_length = "medium": 2–3 sentences
+    - If review_length = "long": 3–4 sentences
+- Platform hints (soft, only when supported by data):
+    * amazon: emphasize product features, performance, durability, value for money.
+    * yelp: emphasize service, staff attitude, environment, waiting time, overall experience.
+    * goodreads: emphasize story, characters, pacing, writing style, emotional impact.
 
-Rules for expertise:
-- If expertise = "expert":
-    • use more technical vocabulary
-    • give analytical evaluation
-- If expertise = "intermediate":
-    • mix some technical terms with practical concerns
-- If expertise = "novice":
-    • use simple consumer-friendly language
-    • focus on ease of use & impressions
-- If expertise = "none":
-    • avoid too technical claims
-    • write like a normal customer
+- Must reference at least one concrete product/experience feature.
+- Follow rating behavior:
+    * persona.rating_behavior.tendency:
+        - generous → higher scores likely
+        - neutral → around typical user score
+        - harsh → stricter, lower scores
+- Maintain consistency with user's historical reviews.
 
-General Rules:
-1. Write 2–4 sentences.
-2. Follow persona's tone, punctuation habits, filler words, and logic.
-3. Mention at least one specific detail of the item.
-4. Rating must follow persona’s rating tendency and past behavior.
-5. Use EXACT format:
+================ EXPERTISE RULES ===============
+expert:
+    - analytical, precise language
+    - domain vocabulary
+intermediate:
+    - mix technical + practical comments
+novice:
+    - simple language, ease-of-use focus
+none:
+    - avoid technical terms
 
+Now output ONLY in required format:
 stars: <rating>
 review: <text>
 """
@@ -375,9 +426,6 @@ class MySimulationAgent(SimulationAgent):
         # planner must take agent to access internal tools
         self.planner = MyPlanner(agent=self, llm=self.llm)
 
-    # ----------------------------------------------------------------------
-    # Internal Tool 1: Analyze item rating distribution
-    # ----------------------------------------------------------------------
     def _analyze_item_ratings(self):
         if not hasattr(self, "_item_reviews") or not self._item_reviews:
             self._item_stats = {"mean_rating": None, "count": 0}
@@ -406,30 +454,6 @@ class MySimulationAgent(SimulationAgent):
         }
         return self._item_stats
 
-    # ----------------------------------------------------------------------
-    # Internal Tool 2: Prepare similar reviews
-    # ----------------------------------------------------------------------
-    """ 
-    def _prepare_similar_reviews(self):
-        similar = []
-
-        for r in getattr(self, "_user_reviews", [])[:3]:
-            similar.append("USER: " + (r.get("text") or ""))
-
-        for r in getattr(self, "_item_reviews", [])[:3]:
-            similar.append("ITEM: " + (r.get("text") or ""))
-
-        item_features = str(getattr(self, "_item_info", ""))
-
-        if hasattr(self, "_item_stats"):
-            item_features += f" | stats={self._item_stats}"
-
-        self._similar_reviews_struct = {
-            "similar_reviews": similar,
-            "item_features": item_features
-        }
-        return self._similar_reviews_struct 
-    """
     def _prepare_similar_reviews(self):
         user_reviews = getattr(self, "_user_reviews", [])
         item_reviews = getattr(self, "_item_reviews", [])
@@ -460,7 +484,7 @@ class MySimulationAgent(SimulationAgent):
         # 3. 用户历史评论取最长的三条
         sorted_user_reviews = sorted(
             user_reviews,
-            key=lambda r: len(r.get("text","")),
+            key=lambda r: len(r.get("text", "")),
             reverse=True
         )
         top_user_reviews = [
@@ -482,9 +506,6 @@ class MySimulationAgent(SimulationAgent):
         return self._similar_reviews_struct
 
 
-    # ----------------------------------------------------------------------
-    # Main Workflow
-    # ----------------------------------------------------------------------
     def workflow(self):
         task = self.task
         plan = self.planner(task)

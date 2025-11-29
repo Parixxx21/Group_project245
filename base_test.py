@@ -10,12 +10,11 @@ api_key = os.getenv("OPEN_API_KEY")
 
 llm_client = OpenAILLM(
     api_key=api_key,
-    model="gpt-4.1-mini"
 )
 
 simulator = Simulator(
     data_dir="./example/processed_data",
-    device="auto",
+    device="cpu",
     cache=False
 )
 
@@ -27,10 +26,18 @@ simulator.set_task_and_groundtruth(
 simulator.set_agent(MySimulationAgent)
 simulator.set_llm(llm_client)
 
-# Modify this if you are using an environment support multi-threading 
-outputs = simulator.run_simulation(number_of_tasks=None, enable_threading=False, 
-    max_workers=1)
+outputs = simulator.run_simulation(
+    number_of_tasks=50, # Should set to None afterwards
+    enable_threading=True,
+    max_workers=3
+)
+
+print("\n==================== RAW OUTPUTS (first 10) ====================")
+for i, out in enumerate(outputs[:10]):
+    print(f"\n--- Task {i} ---")
+    print(out)
+
+groundtruth = simulator.groundtruth_data
 
 results = simulator.evaluate()
-
-print("RESULTS:", results)
+print("\nRESULTS:", results)

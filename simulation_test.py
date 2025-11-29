@@ -1,21 +1,19 @@
-#Test for simulation 
 from websocietysimulator import Simulator
 from websocietysimulator.agent.my_agent import MySimulationAgent
 from websocietysimulator.llm import OpenAILLM
 from dotenv import load_dotenv
 import os
+import json
 
 load_dotenv()
 api_key = os.getenv("OPEN_API_KEY")
 
 llm_client = OpenAILLM(
     api_key=api_key,
-    model="gpt-4.1-mini"
 )
 
 simulator = Simulator(
     data_dir="./example/processed_data",
-    # Modify this if you are using an environment support GPU
     device="cpu",
     cache=False
 )
@@ -28,14 +26,17 @@ simulator.set_task_and_groundtruth(
 simulator.set_agent(MySimulationAgent)
 simulator.set_llm(llm_client)
 
-# Modify this if you are using an environment support multi-threading 
-outputs = simulator.run_simulation(number_of_tasks=None, enable_threading=False, 
-    max_workers=1)
-print("\n==================== RAW OUTPUTS ====================")
-for i, out in enumerate(outputs[:10]): 
+outputs = simulator.run_simulation(
+    number_of_tasks=50, #set to none afterwards
+    enable_threading=True,
+    max_workers=3
+)
+
+print("\n==================== RAW OUTPUTS (first 10) ====================")
+for i, out in enumerate(outputs[:10]):
     print(f"\n--- Task {i} ---")
     print(out)
 
-results = simulator.evaluate()
 
-print("RESULTS:", results)
+results = simulator.evaluate()
+print("\nRESULTS:", results)

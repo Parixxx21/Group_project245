@@ -19,3 +19,4 @@ db/
 example/processed_data
 example/trackOneSubmission_example
 .env
+websocietysimulator/agent/my_agent_rec.py
