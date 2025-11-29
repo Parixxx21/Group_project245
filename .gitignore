@@ -16,3 +16,6 @@ __*/
 !__init__.py
 TODO
 db/
+example/processed_data
+example/trackOneSubmission_example
+.env

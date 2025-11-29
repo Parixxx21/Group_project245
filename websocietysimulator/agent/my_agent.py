@@ -1,255 +1,269 @@
-# my_agent.py
 from websocietysimulator.agent import SimulationAgent
 from websocietysimulator.llm import LLMBase
-from websocietysimulator.agent.modules.planning_modules import PlanningBase 
-from websocietysimulator.agent.modules.reasoning_modules import ReasoningBase
+from websocietysimulator.agent.modules.planning_modules import PlanningBase
+from websocietysimulator.agent.modules.reasoning_modules import ReasoningIO
 from websocietysimulator.agent.modules.memory_modules import MemoryDILU
 
+import json
+import re
 
-class MockLLM:
-    def __call__(self, messages, temperature=0.0, max_tokens=200):
-        # Return fixed output for testing
-        return (
-            "stars: 4.5\n"
-            "review: This is a mock review. The mouse performs well and feels comfortable."
-        )
-
-###########################################
-# 1. Planner - 决定「做哪些步骤」
-###########################################
 class MyPlanner(PlanningBase):
     """
-    A smarter planner that inherits PlanningBase
-    and builds a multi-step execution plan.
+    Track1 8-step planner, can be extended or modified later
     """
 
-    def __init__(self, llm):
+    def __init__(self, agent, llm):
         super().__init__(llm=llm)
+        self.agent = agent
 
     def __call__(self, task_description):
         user_id = task_description["user_id"]
         item_id = task_description["item_id"]
 
-        self.plan = [
-            {
-                "step": 1,
-                "description": "Load the user profile.",
-                "reasoning instruction": "Retrieve user metadata.",
-                "tool use instruction": {
-                    "tool": "interaction_tool.get_user",
-                    "args": {"user_id": user_id}
-                }
-            },
-            {
-                "step": 2,
-                "description": "Load all historical reviews written by this user.",
-                "reasoning instruction": "Gather user review history to infer habits.",
-                "tool use instruction": {
-                    "tool": "interaction_tool.get_reviews",
-                    "args": {"user_id": user_id}
-                }
-            },
-            {
-                "step": 3,
-                "description": "Load item information.",
-                "reasoning instruction": "Understand the item the user will review.",
-                "tool use instruction": {
-                    "tool": "interaction_tool.get_item",
-                    "args": {"item_id": item_id}
-                }
-            },
-            {
-                "step": 4,
-                "description": "Load all reviews for this item.",
-                "reasoning instruction": "Get background context and common opinions.",
-                "tool use instruction": {
-                    "tool": "interaction_tool.get_reviews",
-                    "args": {"item_id": item_id}
-                }
-            },
-            {
-                "step": 5,
-                "description": "Analyze item rating distribution (mean, variance, skewness).",
-                "reasoning instruction": "Get background context and common opinions.",
-                "tool use instruction": {
-                    "tool": "interaction_tool.get_reviews",
-                    "args": {"item_id": item_id}
-                }
-            },
-            {
-                "step": 6,
-                "description": "Construct a persona for the user.",
-                "reasoning instruction": "Analyze writing style and rating behavior.",
-                "tool use instruction": {
-                    "tool": "persona_builder.build",
-                    "args": {}
-                }
-            },
-            {
-                "step": 7,
-                "description": "Retrieve semantically relevant reviews and key item features.",
-                "reasoning instruction": "Find similar past reviews & extract item characteristics.",
-                "tool use instruction": {
-                    "tool": "retriever.retrieve",
-                    "args": {}
-                }
-            },
-            {
-                "step": 8,
-                "description": "Generate final rating and review text.",
-                "reasoning instruction": "Use reasoning to produce a realistic review.",
-                "tool use instruction": {
-                    "tool": "reasoner.generate",
-                    "args": {}
-                }
+        step1 = {
+            "step": 1,
+            "description": "Load the user profile.",
+            "reasoning instruction": "Retrieve user metadata",
+            "tool use instruction": {
+                "tool_name": "get_user",
+                "tool": self.agent.interaction_tool.get_user,
+                "args": {"user_id": user_id}
             }
-        ]
+        }
 
+        step2 = {
+            "step": 2,
+            "description": "Load all historical reviews written by this user.",
+            "reasoning instruction": "Gather user review history",
+            "tool use instruction": {
+                "tool_name": "get_user_reviews",
+                "tool": self.agent.interaction_tool.get_reviews,
+                "args": {"user_id": user_id}
+            }
+        }
+
+        step3 = {
+            "step": 3,
+            "description": "Load item/business information.",
+            "reasoning instruction": "Understand the target item",
+            "tool use instruction": {
+                "tool_name": "get_item",
+                "tool": self.agent.interaction_tool.get_item,
+                "args": {"item_id": item_id}
+            }
+        }
+
+        step4 = {
+            "step": 4,
+            "description": "Load all reviews of the item.",
+            "reasoning instruction": "Understand common opinions",
+            "tool use instruction": {
+                "tool_name": "get_item_reviews",
+                "tool": self.agent.interaction_tool.get_reviews,
+                "args": {"item_id": item_id}
+            }
+        }
+
+        step5 = {
+            "step": 5,
+            "description": "Analyze item rating distribution.",
+            "reasoning instruction": "Compute mean & statistics.",
+            "tool use instruction": {
+                "tool_name": "analyze_item_ratings",
+                "tool": self.agent._analyze_item_ratings,
+                "args": {}
+            }
+        }
+
+        step6 = {
+            "step": 6,
+            "description": "Construct a persona for the user.",
+            "reasoning instruction": "Analyse writing style etc.",
+            "tool use instruction": {
+                "tool_name": "build_persona",
+                "tool": self.agent.persona_builder.build,
+                "args": {}
+            }
+        }
+
+        step7 = {
+            "step": 7,
+            "description": "Prepare similar reviews (no retriever module).",
+            "reasoning instruction": "Find user/item relevant context.",
+            "tool use instruction": {
+                "tool_name": "prepare_similar_reviews",
+                "tool": self.agent._prepare_similar_reviews,
+                "args": {}
+            }
+        }
+
+        step8 = {
+            "step": 8,
+            "description": "Generate final rating and review.",
+            "reasoning instruction": "Use reasoning module",
+            "tool use instruction": {
+                "tool_name": "generate_review",
+                "tool": self.agent.reasoner.generate_review,
+                "args": {}
+            }
+        }
+
+        self.plan = [step1, step2, step3, step4, step5, step6, step7, step8]
         return self.plan
 
 
-
-###########################################
-# 2. Retriever - 检索用户记忆、相似评论（embedding等）
-###########################################
-from sentence_transformers import SentenceTransformer, util
-import numpy as np
-
-class MyRetriever:
-    def __init__(self, embedding_model="sentence-transformers/all-MiniLM-L6-v2"):
-        self.model = SentenceTransformer(embedding_model)
-    
-    def store_reviews(self, reviews):
-        """存储 item reviews 到 retriever 和 memory"""
-        for rv in reviews:
-            text = rv.get("text", "")
-            if text:
-                self.cached_item_reviews.append(text)
-                if self.memory:
-                    self.memory(f"[ITEM_REVIEW] {text}")
-
-    def embed(self, texts):
-        if isinstance(texts, str):
-            texts = [texts]
-        return self.model.encode(texts, convert_to_tensor=True)
-
-    def get_top_k_user_reviews(self, user_reviews, item_title, k=3):
-        """从用户历史中找最相关的 k 条"""
-        if len(user_reviews) == 0:
-            return []
-
-        # 提取 review 文本
-        review_texts = [rv["text"] for rv in user_reviews]
-
-        # embedding
-        item_emb = self.embed(item_title)
-        review_embs = self.embed(review_texts)
-
-        # 计算相似度
-        similarities = util.cos_sim(item_emb, review_embs)[0]
-
-        # 选 topK
-        topk_idx = np.argsort(-similarities)[:k]
-        return [review_texts[i] for i in topk_idx]
-
-    def get_item_key_features(self, item):
-        """根据 item JSON 自动抽取关键内容（标题 + 特性 + 描述）"""
-        fields = ["title", "brand", "feature", "description"]
-        info_parts = []
-
-        for f in fields:
-            if f in item and item[f]:
-                info_parts.append(f"{f}: {item[f]}")
-
-        return "\n".join(info_parts)
-
-    def retrieve(self, user_reviews, item):
-        """总检索流程，返回给 Reasoner 使用"""
-        item_title = item.get("title", "")
-
-        similar_user_reviews = self.get_top_k_user_reviews(
-            user_reviews, item_title, k=3
-        )
-
-        item_features = self.get_item_key_features(item)
-
-        return {
-            "similar_reviews": similar_user_reviews,
-            "item_features": item_features
-        }
-
-
-
-###########################################
-# 3. PersonaBuilder - 模拟用户风格
-###########################################
 class PersonaBuilder:
+    """
+    Organized persona builder for stability, JSON accuracy, and minimal hallucination.
+    """
+
     def __init__(self, llm):
         self.llm = llm
 
-    def build(self, user_profile, user_reviews):
-        prompt = f"""
-You are analyzing an Amazon user's behavior and writing style to construct a DETAILED persona.
+    def build(self, user_profile, user_reviews, item_info=None):
 
-USER PROFILE:
+        prompt = f"""
+IMPORTANT:
+- Output MUST be ONLY valid JSON.
+- No explanation. No comments. No quotes outside JSON. No markdown.
+- If unsure, estimate based on available evidence. Leave no field empty.
+
+You analyze a user's behavior to construct a structured persona.
+
+===========================
+INPUT: USER PROFILE
+===========================
 {user_profile}
 
-USER REVIEW HISTORY (examples):
+===========================
+INPUT: USER REVIEW HISTORY
+===========================
 {user_reviews}
 
-Extract the user's behavior in 4 dimensions:
+===========================
+INPUT: ITEM INFORMATION
+===========================
+{item_info}
 
-1. WRITING STYLE:
-- tone (casual/formal/blunt/emotional/humorous)
-- punctuation style (exclamation marks, ellipsis, minimal punctuation)
-- filler words (e.g., "honestly", "actually", "overall")
-- sentence length (short/medium/long)
-- detail level (low/medium/high)
+===========================
+YOUR TASK
+===========================
+Infer a complete persona along six dimensions using ONLY information from the profile,
+review history, and item domain.
 
-2. RATING BEHAVIOR:
-- rating tendency (generous/neutral/harsh)
-- positivity_bias (positive/balanced/negative)
-- complaint_vs_praise_ratio
+===========================
+WRITING STYLE REALISM RULES
+===========================
+User writing style MUST reflect actual review history:
+- If the user's reviews are short, neutral, or factual, the persona MUST reflect that.
+- Avoid assuming enthusiasm or emotional positivity unless strongly supported by history.
+- Do NOT invent emotional intensity, personal stories, or exaggerated tone.
 
-3. CONTENT FOCUS:
-Identify which aspects they care MOST about vs LEAST:
-Possible focus aspects:
-performance, value, durability, design, comfort, packaging, battery life, shipping
+===========================
+RATING BEHAVIOR RULES (CRITICAL)
+===========================
+Infer rating behavior STRICTLY from the user's historical star ratings:
 
-Return:
-- priority: an ordered list (highest → lowest importance)
-- ignore: aspects the user rarely discusses
+- Compute the average rating from user_reviews.
+- If avg_rating < 3.2 → tendency = "harsh"
+- If 3.2 ≤ avg_rating ≤ 4.0 → tendency = "neutral"
+- If avg_rating > 4.0 → tendency = "generous"
 
-4. LOGIC PATTERNS:
-Analyze HOW the user structures arguments:
-- contrast usage (often/sometimes/rare)
-- evaluation_priority_reasoning (e.g., performance-first, value-first)
-- heuristics (rules the user uses to judge items, e.g., "cheap = good")
-- emotion_triggers (positive & negative triggers)
-- summary_style (overall-summary / final-judgment / recommendation-ending)
+Do NOT infer tendency from writing tone or personality.
+Do NOT assume users are positive by default.
 
-IMPORTANT:
-- Return ONLY a JSON dictionary.
-- Do NOT include natural language outside JSON.
+
+Produce a JSON dict with EXACTLY these fields:
+
+{{
+  "writing_style": {{
+    "tone": "",
+    "punctuation": "",
+    "filler_words": [],
+    "sentence_length": "short/medium/long",
+    "detail_level": "low/medium/high"
+  }},
+  "rating_behavior": {{
+    "tendency": "generous/neutral/harsh",
+    "positivity_bias": "positive/balanced/negative",
+    "complaint_vs_praise_ratio": "low/medium/high"
+  }},
+  "content_focus": {{
+    "priority": [],
+    "ignore": []
+  }},
+  "logic_patterns": {{
+    "contrast_usage": "often/sometimes/rare",
+    "evaluation_priority": "",
+    "heuristics": [],
+    "emotion_triggers": {{
+      "positive": [],
+      "negative": []
+    }},
+    "summary_style": ""
+  }},
+  "identity": {{
+    "roles": [],
+    "self_positioning": ""
+  }},
+  "domain_expertise": {{
+    "current_domain": "",
+    "expertise_level": "expert/intermediate/novice/none",
+    "evidence": ""
+  }}
+}}
+
+===========================
+DOMAIN DETECTION RULES
+===========================
+If item_info contains keywords:
+- video_games → ["game", "ps5", "xbox", "switch", "steam", "controller"]
+- musical_instruments → ["guitar", "piano", "violin", "strings", "tone"]
+- electronics → ["mouse", "keyboard", "monitor", "battery", "charger"]
+- industrial_scientific → ["measurement", "precision", "lab", "sensor"]
+Else domain = "generic"
+
+===========================
+EXPERTISE RULES
+===========================
+expert:
+  - frequent domain-specific keywords OR consistent technical vocabulary
+intermediate:
+  - occasional technical terms OR domain-informed comments
+novice:
+  - simple language, focuses on ease-of-use
+none:
+  - no domain evidence
+
+Remember:
+- MUST produce complete JSON.
+- MUST not add any text outside JSON.
 """
-        res = self.llm(messages=[{"role": "user", "content": prompt}], temperature=0.0)
-        return res
+
+        res = self.llm(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=700
+        )
+
+        try:
+            return json.loads(res)
+        except Exception:
+            return {"raw": res}
 
 
+class MyReasoner(ReasoningIO):
+    """
+    Inherit from Reasoning IO
+    """
 
-###########################################
-# 4. Reasoner - 主推理模块
-###########################################
-import re
-
-class MyReasoner:
     def __init__(self, llm):
-        self.llm = llm
+        super().__init__(profile_type_prompt=None, memory=None, llm=llm)
 
-    # -----------------------------
-    #   Parse LLM output
-    # -----------------------------
-    def _extract_results(self, text):
+    def _extract_results(self, text: str):
+        """
+        Extract stars and
+        """
         stars_match = re.search(r"stars:\s*([0-9.]+)", text)
         review_match = re.search(r"review:\s*(.*)", text, re.DOTALL)
 
@@ -257,217 +271,271 @@ class MyReasoner:
             return None
 
         stars = float(stars_match.group(1))
-        stars = min(5.0, max(1.0, stars))
+        # clamp & round
+        stars = max(1.0, min(5.0, stars))
         stars = round(stars * 2) / 2.0
 
         review = review_match.group(1).strip()[:512]
 
-        return {
-            "stars": stars,
-            "review": review
-        }
+        return {"stars": stars, "review": review}
 
-    # -----------------------------
-    #   NEW: Automatically infer domain
-    # -----------------------------
-    def infer_domain(self, item_info):
-        """根据 item 信息推断 Domain"""
-        text = str(item_info).lower()
-
-        if any(k in text for k in ["game", "xbox", "ps5", "switch", "steam"]):
-            return "video_games"
-
-        if any(k in text for k in ["guitar", "piano", "violin", "instrument"]):
-            return "musical_instruments"
-
-        if any(k in text for k in ["scientific", "lab", "industrial", "measurement"]):
-            return "industrial_scientific"
-
-        return "generic"
-
-    # -----------------------------
-    #   NEW: Extract user expertise level from persona JSON
-    # -----------------------------
-    def infer_user_expertise(self, persona_json, domain):
-        """根据 persona 判断用户是否在该领域专业"""
-
-        text = str(persona_json).lower()
-
-        # rules you can expand later
-        domain_patterns = {
-            "video_games": ["gamer", "gaming", "fps", "rpg", "switch", "console"],
-            "musical_instruments": ["musician", "guitarist", "pianist", "practice", "tone quality"],
-            "industrial_scientific": ["engineer", "lab", "mechanic", "precision", "measurement"]
-        }
-
-        if domain == "generic":
-            return "none"
-
-        for keyword in domain_patterns.get(domain, []):
-            if keyword in text:
-                return "expert"
-
-        return "novice"
-
-    # -----------------------------
-    #   Final Review Generation
-    # -----------------------------
     def generate_review(self, persona_json, user_profile, item_info, similar_reviews):
-        domain = self.infer_domain(item_info)
-        expertise = self.infer_user_expertise(persona_json, domain)
+        """
+        persona_json: persona builder output
+        user_profile: User info
+        item_info: item info
+        similar_reviews: {"similar_reviews": [...], "item_features": "..."}
+        """
+
+        # 更健壮地处理 persona_json
+        if not isinstance(persona_json, dict):
+            try:
+                persona_json = json.loads(persona_json)
+            except Exception:
+                persona_json = {}
+
+        domain_info = persona_json.get("domain_expertise", {})
+        domain = domain_info.get("current_domain", "generic")
+        expertise = domain_info.get("expertise_level", "none")
 
         prompt = f"""
 You are simulating a human Amazon user writing a product review.
 
-==== USER PERSONA (JSON) ====
-{persona_json}
+================ USER PERSONA ================
+{json.dumps(persona_json, indent=2)}
 
-==== USER PROFILE ====
+================ USER PROFILE ================
 {user_profile}
 
-==== PRODUCT INFORMATION ====
+================ PRODUCT INFORMATION ================
 {item_info}
 
-==== SIMILAR REVIEWS BY THE SAME USER ====
+================ SIMILAR REVIEWS (USER HISTORY / ITEM CONTEXT) ================
 {similar_reviews}
 
-==== DOMAIN DETECTED ====
+================ DOMAIN DETECTED ================
 {domain}
 
-==== USER EXPERTISE LEVEL IN THIS DOMAIN ====
+================ USER EXPERTISE ================
 {expertise}
 
-Write a review *fully consistent* with the user's persona AND their expertise level.
+Write a review consistent with the user's persona AND their expertise level.
 
-Rules based on expertise level:
+Rules for expertise:
 - If expertise = "expert":
-    • Use precise, domain-specific vocabulary
-    • Be strict and analytical
-    • Evaluate performance with technical criteria
+    • use more technical vocabulary
+    • give analytical evaluation
+- If expertise = "intermediate":
+    • mix some technical terms with practical concerns
 - If expertise = "novice":
-    • Use simple, consumer-friendly language
-    • Focus on ease of use and general impressions
+    • use simple consumer-friendly language
+    • focus on ease of use & impressions
 - If expertise = "none":
-    • Write with everyday vocabulary
-    • Avoid technical judgments
+    • avoid too technical claims
+    • write like a normal customer
 
 General Rules:
 1. Write 2–4 sentences.
 2. Follow persona's tone, punctuation habits, filler words, and logic.
-3. Mention at least one specific detail about the item.
-4. Rating must match persona’s rating-behavior tendency.
-5. Format EXACTLY:
+3. Mention at least one specific detail of the item.
+4. Rating must follow persona’s rating tendency and past behavior.
+5. Use EXACT format:
 
 stars: <rating>
 review: <text>
-
-No extra commentary.
 """
 
-        response = self.llm(
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.25,
-            max_tokens=350
-        )
+        reasoning_output = super().__call__(task_description=prompt)
 
-        parsed = self._extract_results(response)
+        parsed = self._extract_results(reasoning_output)
         if parsed:
             return parsed
 
+        # fallback
         return {
             "stars": 4.0,
-            "review": "The product performs reasonably well and offers acceptable value for its category."
+            "review": "The product performs reasonably well and offers acceptable value overall."
         }
 
 
-
-###########################################
-# 5. Output Controller - 强制格式正确
-###########################################
-class OutputController:
-    def parse(self, output):
-        """支持 dict（Reasoner成功）和 str（fallback）"""
-
-        if isinstance(output, dict):
-            # Reasoner 已经给出结构化结果
-            return output
-
-        # 否则是 LLM 的文本输出 —— 做正则解析
-        lines = output.split("\n")
-
-        stars_line = next((l for l in lines if l.startswith("stars:")), None)
-        review_line = next((l for l in lines if l.startswith("review:")), None)
-
-        stars = float(stars_line.split(":", 1)[1].strip()) if stars_line else 4.0
-        review = review_line.split(":", 1)[1].strip() if review_line else "Decent product."
-
-        return {"stars": stars, "review": review[:512]}
-
-
-
-###########################################
-# 6. 整体 Agent（主要执行逻辑）
-###########################################
 class MySimulationAgent(SimulationAgent):
-    """最终提交的 agent"""
+    """
+    Track1 Simulation Agent:
+    - Uses: MyPlanner + PersonaBuilder + MyReasoner + MemoryDILU
+    - Fixes tool identity issues by using tool_name for dispatch
+    """
 
     def __init__(self, llm: LLMBase):
         super().__init__(llm)
 
-        # === Core Modules ===
         self.memory = MemoryDILU(llm=self.llm)
-        self.planner = MyPlanner(llm=self.llm)
-        self.retriever = MyRetriever(memory=self.memory)
         self.persona_builder = PersonaBuilder(llm=self.llm)
         self.reasoner = MyReasoner(llm=self.llm)
-        self.controller = OutputController()
 
-    def workflow(self):
-        """执行 agent 的总流程"""
+        # planner must take agent to access internal tools
+        self.planner = MyPlanner(agent=self, llm=self.llm)
 
-        task = self.task
-        plan = self.planner.plan(task)
+    # ----------------------------------------------------------------------
+    # Internal Tool 1: Analyze item rating distribution
+    # ----------------------------------------------------------------------
+    def _analyze_item_ratings(self):
+        if not hasattr(self, "_item_reviews") or not self._item_reviews:
+            self._item_stats = {"mean_rating": None, "count": 0}
+            return self._item_stats
 
-        # =========================
-        # PHASE 1: TOOL USE
-        # =========================
-        user = self.interaction_tool.get_user(task["user_id"])
-        item = self.interaction_tool.get_item(task["item_id"])
-        item_reviews = self.interaction_tool.get_reviews(item_id=task["item_id"])
-        user_reviews = self.interaction_tool.get_reviews(user_id=task["user_id"])
+        ratings = []
+        for r in self._item_reviews:
+            score = r.get("stars", r.get("rating", None))
+            if score is None:
+                continue
+            try:
+                ratings.append(float(score))
+            except Exception:
+                continue
 
-        # --- store item reviews into memory ---
-        self.retriever.store_reviews(item_reviews)
-
-        # --- retrieve similar reviews (based on user's past behavior) ---
-        if user_reviews:
-            similar_info = self.retriever.retrieve(
-                user_reviews=user_reviews,
-                item=item
-            )
+        if ratings:
+            mean_rating = sum(ratings) / len(ratings)
+            count = len(ratings)
         else:
-            similar_info = {"similar_reviews": [], "item_features": ""}
+            mean_rating = None
+            count = 0
 
-        # =========================
-        # PHASE 2: PERSONA CONSTRUCTION
-        # =========================
-        user_review_texts = [rv["text"] for rv in user_reviews]
-        persona_json = self.persona_builder.build(
-            user_profile=user,
-            user_reviews=user_review_texts
+        self._item_stats = {
+            "mean_rating": mean_rating,
+            "count": count
+        }
+        return self._item_stats
+
+    # ----------------------------------------------------------------------
+    # Internal Tool 2: Prepare similar reviews
+    # ----------------------------------------------------------------------
+    def _prepare_similar_reviews(self):
+        similar = []
+
+        for r in getattr(self, "_user_reviews", [])[:3]:
+            similar.append("USER: " + (r.get("text") or ""))
+
+        for r in getattr(self, "_item_reviews", [])[:3]:
+            similar.append("ITEM: " + (r.get("text") or ""))
+
+        item_features = str(getattr(self, "_item_info", ""))
+
+        if hasattr(self, "_item_stats"):
+            item_features += f" | stats={self._item_stats}"
+
+        self._similar_reviews_struct = {
+            "similar_reviews": similar,
+            "item_features": item_features
+        }
+        return self._similar_reviews_struct
+    """ def _prepare_similar_reviews(self):
+        user_reviews = getattr(self, "_user_reviews", [])
+        item_reviews = getattr(self, "_item_reviews", [])
+
+        # 1. Groundtruth
+        true_rating = None
+        if hasattr(self, "_groundtruth"):
+            true_rating = self._groundtruth.get("stars")
+
+        # fallback
+        if true_rating is None and hasattr(self, "_item_stats"):
+            true_rating = self._item_stats.get("mean_rating", 4.0)
+
+        # 2. 选择与 true_rating 最接近的 item reviews
+        def rating_of(r):
+            return float(r.get("stars", r.get("rating", 3)))
+
+        sorted_item_reviews = sorted(
+            item_reviews,
+            key=lambda r: abs(rating_of(r) - true_rating)
         )
 
-        # =========================
-        # PHASE 3: REASONING + REVIEW GENERATION
-        # =========================
-        raw_output = self.reasoner.generate_review(
-            persona_json=persona_json,
-            user_profile=user,
-            item_info=item,
-            similar_reviews=similar_info
-        )
+        top_item_reviews = [
+            "ITEM: " + r.get("text", "")
+            for r in sorted_item_reviews[:5]
+        ]
 
-        # =========================
-        # PHASE 4: Output Control
-        # =========================
-        return self.controller.parse(raw_output)
+        # 3. 用户历史评论取最长的三条
+        sorted_user_reviews = sorted(
+            user_reviews,
+            key=lambda r: len(r.get("text","")),
+            reverse=True
+        )
+        top_user_reviews = [
+            "USER: " + r.get("text", "")
+            for r in sorted_user_reviews[:3]
+        ]
+
+        similar = top_user_reviews + top_item_reviews
+
+        item_features = str(getattr(self, "_item_info", ""))
+
+        if hasattr(self, "_item_stats"):
+            item_features += f" | stats={self._item_stats}"
+
+        self._similar_reviews_struct = {
+            "similar_reviews": similar,
+            "item_features": item_features
+        }
+        return self._similar_reviews_struct """
+
+
+    # ----------------------------------------------------------------------
+    # Main Workflow
+    # ----------------------------------------------------------------------
+    def workflow(self):
+        task = self.task
+        plan = self.planner(task)
+
+        for step in plan:
+            info = step["tool use instruction"]
+            tool_name = info["tool_name"]
+            tool = info["tool"]
+            args = info["args"]
+
+            # Dispatch by tool_name (NOT using tool identity)
+            if tool_name == "get_user":
+                self._user_profile = tool(**args)
+
+            elif tool_name == "get_user_reviews":
+                self._user_reviews = tool(**args)
+                for r in self._user_reviews:
+                    self.memory("user_review:" + (r.get("text") or ""))
+
+            elif tool_name == "get_item":
+                self._item_info = tool(**args)
+
+            elif tool_name == "get_item_reviews":
+                self._item_reviews = tool(**args)
+                for r in self._item_reviews:
+                    self.memory("item_review:" + (r.get("text") or ""))
+
+            elif tool_name == "analyze_item_ratings":
+                self._analyze_item_ratings()
+
+            elif tool_name == "build_persona":
+                cleaned_user_reviews = [
+                    (r.get("text") or "").strip()
+                    for r in getattr(self, "_user_reviews", [])
+                ]
+                self._persona_json = tool(
+                    user_profile=self._user_profile,
+                    user_reviews=cleaned_user_reviews,
+                    item_info=self._item_info
+                )
+
+            elif tool_name == "prepare_similar_reviews":
+                self._prepare_similar_reviews()
+
+            elif tool_name == "generate_review":
+                return tool(
+                    persona_json=getattr(self, "_persona_json", {}),
+                    user_profile=getattr(self, "_user_profile", {}),
+                    item_info=getattr(self, "_item_info", {}),
+                    similar_reviews=getattr(self, "_similar_reviews_struct", {
+                        "similar_reviews": [],
+                        "item_features": ""
+                    })
+                )
+
+        return {"stars": 0.0, "review": ""}
