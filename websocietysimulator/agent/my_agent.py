@@ -409,6 +409,7 @@ class MySimulationAgent(SimulationAgent):
     # ----------------------------------------------------------------------
     # Internal Tool 2: Prepare similar reviews
     # ----------------------------------------------------------------------
+    """ 
     def _prepare_similar_reviews(self):
         similar = []
 
@@ -427,8 +428,9 @@ class MySimulationAgent(SimulationAgent):
             "similar_reviews": similar,
             "item_features": item_features
         }
-        return self._similar_reviews_struct
-    """ def _prepare_similar_reviews(self):
+        return self._similar_reviews_struct 
+    """
+    def _prepare_similar_reviews(self):
         user_reviews = getattr(self, "_user_reviews", [])
         item_reviews = getattr(self, "_item_reviews", [])
 
@@ -477,7 +479,7 @@ class MySimulationAgent(SimulationAgent):
             "similar_reviews": similar,
             "item_features": item_features
         }
-        return self._similar_reviews_struct """
+        return self._similar_reviews_struct
 
 
     # ----------------------------------------------------------------------
