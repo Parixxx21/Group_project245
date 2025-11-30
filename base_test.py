@@ -1,5 +1,6 @@
 from websocietysimulator import Simulator
 from example.trackOneSubmission_example.userBehaviorSimulation import MySimulationAgent
+from example.RecAgent_baseline import MyRecommendationAgent
 from websocietysimulator.llm import OpenAILLM
 
 from dotenv import load_dotenv
@@ -19,15 +20,15 @@ simulator = Simulator(
 )
 
 simulator.set_task_and_groundtruth(
-    task_dir="./example/track1/amazon/tasks",
-    groundtruth_dir="./example/track1/amazon/groundtruth"
+    task_dir="./example/track2/amazon/tasks",
+    groundtruth_dir="./example/track2/amazon/groundtruth"
 )
 
-simulator.set_agent(MySimulationAgent)
+simulator.set_agent(MyRecommendationAgent)
 simulator.set_llm(llm_client)
 
 outputs = simulator.run_simulation(
-    number_of_tasks=50, # Should set to None afterwards
+    number_of_tasks=20, # Should set to None afterwards
     enable_threading=True,
     max_workers=3
 )
@@ -37,7 +38,6 @@ for i, out in enumerate(outputs[:10]):
     print(f"\n--- Task {i} ---")
     print(out)
 
-groundtruth = simulator.groundtruth_data
 
 results = simulator.evaluate()
 print("\nRESULTS:", results)
