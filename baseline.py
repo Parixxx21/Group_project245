@@ -1,6 +1,5 @@
 from websocietysimulator import Simulator
-from websocietysimulator.agent.my_agent_track1 import MySimulationAgent
-from websocietysimulator.agent.my_agent_rec import MyRecommendationAgent
+from example.ModelingAgent_baseline import MySimulationAgent
 from websocietysimulator.llm import OpenAILLM
 from dotenv import load_dotenv
 import os
@@ -27,11 +26,10 @@ simulator.set_task_and_groundtruth(
 simulator.set_agent(MySimulationAgent)
 simulator.set_llm(llm_client)
 
-
 outputs = simulator.run_simulation(
-    number_of_tasks=20, #set to none afterwards
+    number_of_tasks=50, #set to none afterwards
     enable_threading=True,
-    max_workers=2
+    max_workers=5
 )
 
 print("\n==================== RAW OUTPUTS (first 10) ====================")

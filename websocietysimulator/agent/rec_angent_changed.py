@@ -8,8 +8,6 @@ from collections import Counter
 import json
 import re
 import tiktoken
-from langchain.docstore.document import Document
-
 
 ENC = tiktoken.get_encoding("cl100k_base")
 
@@ -98,57 +96,6 @@ class SafeIOUtils:
             return text[start:end+1]
 
         return None
-
-
-# ============================
-#  Enhanced MemoryDILU
-# ============================
-class MyMemoryDILU(MemoryDILU):
-
-    # ----------- 清洗文本（防止 embedding 混乱） -----------
-    def _clean(self, text: str):
-        if not text:
-            return ""
-        text = str(text)
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()[:400]   # avoid prompt explosion
-
-    # ----------- 摘关键词 -----------
-    def _extract_keywords(self, text: str):
-        text = text.lower()
-        toks = re.findall(r"[a-zA-Z]{3,}", text)
-        stop = {"the","and","but","not","very","with","this","that","have","for"}
-        toks = [t for t in toks if t not in stop]
-        return " ".join(toks[:15])
-
-    # ----------- 添加记忆（覆盖 baseline 的 addMemory） -----------
-    def addMemory(self, current_situation: str):
-        clean = self._clean(current_situation)
-        keywords = self._extract_keywords(clean)
-
-        doc = Document(
-            page_content=keywords,       # 用关键词做 embedding（更稳定）
-            metadata={"task_trajectory": clean}
-        )
-        self.scenario_memory.add_documents([doc])
-
-    # ----------- 检索记忆（覆盖 baseline 的 retriveMemory） -----------
-    def retriveMemory(self, query_scenario: str):
-
-        if self.scenario_memory._collection.count() == 0:
-            return ""
-
-        clean_query = self._clean(query_scenario)
-        query_kw = self._extract_keywords(clean_query)
-
-        result = self.scenario_memory.similarity_search_with_score(query_kw, k=1)
-
-        if not result:
-            return ""
-
-        # 返回原始 trajectory（不是关键词）
-        return result[0][0].metadata["task_trajectory"]
-
 
 class MyPlanner(PlanningBase):
     """
@@ -242,15 +189,17 @@ class PreferenceBuilder:
         self.memory = memory
         self.use_memory = use_memory
 
-    # ---------------------------------------------------------------
-    #   Helpers
-    # ---------------------------------------------------------------
     def _detect_platform(self, item_info):
+        """
+        item_info can be:
+        - None
+        - a single item_info dict
+        - a dict of {item_id: item_info_dict}
+        """
         try:
             if item_info is None:
                 return "unknown"
 
-            # dict of dicts
             if isinstance(item_info, dict) and all(isinstance(v, dict) for v in item_info.values()):
                 first = next(iter(item_info.values()))
                 return self._detect_platform(first)
@@ -269,6 +218,7 @@ class PreferenceBuilder:
                 return "goodreads"
         except:
             pass
+
         return "unknown"
 
     def _summarize_user_reviews(self, reviews):
@@ -283,45 +233,44 @@ class PreferenceBuilder:
             })
         return out
 
-    # ---------------------------------------------------------------
-    #   Memory Retrieval
-    # ---------------------------------------------------------------
     def _retrieve_memory_context(self, user_profile):
+        """
+        Query memory module for hidden long-term patterns.
+        """
         if (not self.use_memory) or (self.memory is None):
             return ""
 
         try:
-            query = (
-                "Summarize long-term stable preferences of this user based on stored review memories. "
-                "Focus on categories, liked attributes, disliked aspects, and repeated patterns. "
+            q = (
+                "Summarize this user's long-term stable preferences based on past memory data. "
+                "Focus on categories, liked attributes, disliked aspects, writing style, common rating patterns. "
                 f"User profile: {user_profile}"
             )
-            raw = self.memory(query)
+            raw = self.memory(q)
             return truncate_tokens(str(raw), max_tokens=350)
         except:
             return ""
 
-    # ---------------------------------------------------------------
-    #   MAIN BUILD FUNCTION
-    # ---------------------------------------------------------------
     def build(self, user_profile, user_reviews, item_info=None):
+
         platform = self._detect_platform(item_info)
         summarized_reviews = self._summarize_user_reviews(user_reviews)
+
+        # ====== NEW MEMORY CONTEXT ======
         memory_context = self._retrieve_memory_context(user_profile)
 
-        # ---------------------------------------------------------------
-        #   FULL RULES PROMPT (zero hallucination)
-        # ---------------------------------------------------------------
+        # ====== FULL RULES INCLUDED ======
         prompt = f"""
 Return ONLY valid JSON. The first non-whitespace character must be '{{'.
+Do NOT output any commentary or explanation outside JSON.
 
 Your task: extract a *user preference profile*.
-All attributes MUST be grounded in:
-- USER REVIEWS (text or keywords)
-- ITEM INFO fields
+All categories & attributes MUST come from:
+- USER REVIEWS (text or implied keywords)
+- ITEM INFO fields (platform-specific)
 - MEMORY CONTEXT (if provided)
 
-NO hallucinations.
+You MUST NOT hallucinate categories/attributes not grounded in the above.
 
 ================= INPUTS =================
 PLATFORM:
@@ -342,41 +291,70 @@ MEMORY CONTEXT:
 ================= RULES ==================
 
 [1] semantic_categories (dict)
-- Keys must appear in reviews, item_info categories, or memory_context
-- Values must be: "high", "medium", "low"
+- Keys must come from text observed in:
+    * user reviews, OR
+    * item categories/fields, OR
+    * memory context (if provided)
+- Values must be EXACTLY one of:
+    "high", "medium", "low"
+
+Example:
+{{
+  "children's books": "high",
+  "fantasy": "medium"
+}}
 
 [2] preferred_attributes (list)
-- Explicitly praised attributes in reviews
-- Positive attributes from item_info of highly-rated items
-- Positive signals in memory_context
+- Attributes explicitly praised in review text.
+- OR attributes from item_info ONLY IF those items were rated high.
+- OR positive attributes implied in memory context.
+- Must be short natural-language attribute labels.
 
 [3] disliked_attributes (list)
-- Attributes clearly criticized in reviews
-- Negative patterns from memory_context
+- Attributes explicitly criticized.
+- OR negative features implied in memory context.
+- Should contain clear negative signals: e.g., "poor durability", "inaccurate description".
 
 [4] attribute_preference_strength (dict)
-- Each key is an attribute from preferred or disliked lists
-- Each value is "high", "medium", or "low"
-- Strength must reflect evidence intensity
+- Combine information from:
+    * preferred attributes
+    * disliked attributes
+    * memory context indicators
+- Each key must be an attribute.
+- Each value must be one of:
+    "high", "medium", "low"
 
-[5] price_sensitivity (string)
-- If reviews/memory mention “expensive/overpriced” → "high"
-- If reviews/memory mention “good value/worth it” → "low"
-- Else → "medium"
+[5] price_sensitivity
+Rules:
+- If reviews or memory mention “expensive”, “overpriced” → "high"
+- If reviews or memory say “good value”, “worth it” → "low"
+- Otherwise → "medium"
 
 [6] brand_loyalty (list)
-- Include brands/authors repeatedly praised
-- Use memory_context for long-term brand patterns
+For Amazon/Goodreads:
+- If the user often praises the same brand/author, list them here.
+- If memory context indicates repeated preferences, include them.
 
-[7] topic_keywords (5–10 keywords)
-- Extract from reviews / item_info / memory_context
-- NO hallucinated concepts
+For Yelp:
+- Typically leave empty unless user consistently praises a specific chain.
+
+[7] topic_keywords (list of 5–10 strings)
+- Extract ONLY from:
+    * review text
+    * item_info fields
+    * memory context
+- Must be real tokens or short phrases actually found or directly implied.
+- No hallucinations.
 
 [8] summary (1–2 sentences)
-- Summarize categories + preferred attributes + dislikes + price sensitivity
-- MUST NOT introduce unseen information
+- Summarize key tastes:
+    * preferred categories
+    * favored attributes
+    * disliked aspects
+    * price sensitivity
+- MUST NOT hallucinate new facts not in inputs.
 
-================= OUTPUT SCHEMA =================
+================= OUTPUT JSON SCHEMA =================
 {{
   "semantic_categories": {{}},
   "preferred_attributes": [],
@@ -389,9 +367,7 @@ MEMORY CONTEXT:
 }}
 """
 
-        # ---------------------------------------------------------------
-        #   CALL LLM
-        # ---------------------------------------------------------------
+        # ====== RUN LLM ======
         res = self.llm(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
@@ -400,6 +376,7 @@ MEMORY CONTEXT:
 
         parsed = SafeIOUtils.parse_json(res, fallback={})
 
+        # base schema
         schema = {
             "semantic_categories": {},
             "preferred_attributes": [],
@@ -410,202 +387,234 @@ MEMORY CONTEXT:
             "topic_keywords": [],
             "summary": ""
         }
+
         if isinstance(parsed, dict):
             schema.update(parsed)
 
         return schema
 
 
+
+
 class RankingReasoner(ReasoningBase):
     def __init__(self, llm, memory=None, use_memory=True):
+        """
+        llm: LLMBase 实例
+        memory: MemoryDILU 实例（可为 None）
+        use_memory: 是否在排序时使用记忆检索的信息
+        """
         super().__init__(profile_type_prompt="", memory=memory, llm=llm)
         self.use_memory = use_memory
 
-    # ---------------------------------------------------------------
-    #   Helper Functions
-    # ---------------------------------------------------------------
     def _summarize_candidate_reviews(self, reviews_dict):
+        """
+        reviews_dict: {item_id: [reviews]}
+        每个 item 最多保留 2 条，每条 text 截断 200 字符
+        """
         out = {}
         for iid, reviews in (reviews_dict or {}).items():
             if not isinstance(reviews, list):
                 continue
-            short = []
-            for r in reviews[:2]:
+            limited = []
+            for r in reviews[:2]:   # 每个 item 只保留两条
                 if not isinstance(r, dict):
                     continue
-                short.append({
+                limited.append({
                     "text": (r.get("text") or "")[:200],
                     "stars": r.get("stars")
                 })
-            out[iid] = short
+            out[iid] = limited
         return out
 
-    # ---------------------------------------------------------------
-    #   MEMORY QUERY
-    # ---------------------------------------------------------------
     def _build_memory_query(self, preference_profile, candidate_items):
+        """
+        构造一个用于 MemoryDILU 检索的 query 文本。
+        目标：让 MemoryDILU 返回 “跟这个用户长期偏好最相关的历史片段”。
+        """
         try:
             summary = preference_profile.get("summary", "")
             cats = list((preference_profile.get("semantic_categories") or {}).keys())
-        except:
+        except Exception:
             summary = ""
             cats = []
 
+        # 取前几个候选 item 的 title/name，帮助 memory 选相似的历史内容
         item_titles = []
         for c in candidate_items[:5]:
+            if not isinstance(c, dict):
+                continue
             title = c.get("title") or c.get("name") or ""
             if title:
                 item_titles.append(title)
 
-        return (
-            f"User long-term preference summary: {summary}\n"
-            f"Main semantic categories: {cats}\n"
-            f"Representative candidate items: {item_titles}\n"
-            "Retrieve the historically most relevant user/item review memories."
-        )
+        query = f"""
+User long-term preference summary: {summary}
+Main semantic categories: {cats}
+Representative candidate items: {item_titles}
+
+Please retrieve past user/item reviews that best reflect this user's stable tastes.
+"""
+        return query
 
     def _retrieve_memory_context(self, preference_profile, candidate_items):
+        """
+        调用 MemoryDILU，取出与当前用户偏好最相关的一些历史片段。
+        如果 memory 不可用或调用失败，则返回空字符串。
+        """
         if (not self.use_memory) or (self.memory is None):
             return ""
 
         try:
             query = self._build_memory_query(preference_profile, candidate_items)
-            raw = self.memory(query)
-            return truncate_tokens(str(raw), max_tokens=400)
-        except:
+            raw_memory = self.memory(query)  # MemoryDILU 在 baseline 里就是这样 __call__ 使用的
+            # 控制长度，避免把 prompt 撑爆
+            memory_context = truncate_tokens(str(raw_memory), max_tokens=400)
+            return memory_context
+        except Exception:
             return ""
 
-    # ---------------------------------------------------------------
-    #   MAIN RANKING FUNCTION
-    # ---------------------------------------------------------------
     def generate_ranking(self, preference_profile, candidate_items, candidate_items_reviews):
+        """
+        Main ranking function (not using ReasoningBase.__call__()).
+        """
         summarized_reviews = self._summarize_candidate_reviews(candidate_items_reviews)
+
+        # ========= 新增：从 MemoryDILU 取出与本次排序相关的记忆 =========
         memory_context = self._retrieve_memory_context(preference_profile, candidate_items)
 
-        # ---------------------------------------------------------------
-        #   FULL RULE PROMPT (with memory injection)
-        # ---------------------------------------------------------------
         prompt = f"""
 You are ranking items for a user.
 
-# MEMORY CONTEXT
-Historical long-term user preferences:
+# USER MEMORY (retrieved by the agent)
+The following texts are retrieved from the agent's long-term memory and
+summarize the user's stable tastes and historically liked/disliked patterns:
+
 {memory_context}
 
 # USER PREFERENCE PROFILE (JSON)
+This profile is built from the user's historical reviews and item information:
+
 {json.dumps(preference_profile, indent=2)}
 
 # CANDIDATE ITEMS
+Each item has metadata fields such as title, categories, attributes, price, etc.:
+
 {json.dumps(candidate_items, indent=2)}
 
-# CANDIDATE REVIEWS (summarized)
+# CANDIDATE REVIEWS
+For each candidate item, you see up to 2 community reviews (truncated):
+
 {json.dumps(summarized_reviews, indent=2)}
 
 Your task:
-Return a JSON list of ALL item_ids sorted from most preferred to least preferred.
+Sort ALL candidate item_ids from most preferred to least preferred.
 
 ====================== RANKING RULES ======================
 
-1. Semantic Categories
-   - Stronger match → higher rank
-   - Order: high > medium > low
+1. Use semantic_categories first  
+   - Stronger category match → higher rank  
+   - Use the strength weight ("high" > "medium" > "low")
+   - This is the strongest indicator.
 
-2. Preferred Attributes
-   - Match in item fields OR reviews → increase rank
+2. Use preferred_attributes  
+   - If an item (its fields OR its reviews) contains or implies these attributes,
+     increase its rank.
 
-3. Disliked Attributes
-   - Match signals → decrease rank
+3. Use disliked_attributes  
+   - If an item (its fields OR its reviews) contains or implies these attributes,
+     decrease its rank.
 
-4. Attribute Alignment
-   - Extract attributes from BOTH item_info + reviews text
-   - Match against preference_profile AND memory_context
+4. Attribute Extraction and Alignment  
+   - You MUST extract item attributes from BOTH:
+        * candidate_items fields
+        * candidate_items_reviews text
+   - You MUST match extracted attributes against the user preference profile
+     AND the retrieved memory context.
+   - Items with more aligned attributes must rank higher.
 
-5. Price Sensitivity
-   - If user is price-sensitive, penalize expensive/overpriced signals
-   - If low sensitivity, reward “worth it” signals
+5. Consider price_sensitivity  
+   - If the item or its reviews mention “expensive”, “overpriced”, “worth it”,
+     interpret them based on the user’s price_sensitivity.
 
-6. Brand Loyalty
-   - Reward matches to user's preferred brands/authors
+6. Use brand_loyalty  
+   - If the user prefers certain brands/authors and the item belongs to them,
+     increase rank.
 
-7. Memory Consistency
-   - Memory context may indicate strong long-term patterns
-   - Reward items similar to historically liked ones
-   - Penalize patterns similar to historically disliked ones
+7. Consistency with Memory  
+   - If memory_context shows strong historical preference for certain categories,
+     authors, brands, or attributes, prefer items that match them.
+   - If memory_context shows repeated complaints, down-rank similar items.
 
-8. No Hallucinations
-   - Must use ONLY candidate item_ids
-   - No extra ids
+8. No Hallucinations  
+   - Use only item_ids from candidate_items.
+   - Do NOT create new ids.
+   - Output must match the candidate list exactly.
 
-9. Output Format
-   - Return ONLY JSON list, e.g.:
-     ["id1", "id2", "id3"]
+9. Output Format  
+   - Return ONLY a pure JSON list of item_ids.
+   - No explanation.
 
-===========================================================
+================ OUTPUT EXAMPLE ================
+["id1","id2","id3"]
 """
-
         raw_output = self.llm(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=350,
+            max_tokens=300
         )
 
         fallback = [item["item_id"] for item in candidate_items]
-        ranked = SafeIOUtils.parse_json_list(raw_output, fallback=fallback)
+        ranked_ids = SafeIOUtils.parse_json_list(raw_output, fallback=fallback)
 
-        # ensure exact match set
+        # 过滤掉不在候选里的 id，并补齐缺失
         id_set = {item["item_id"] for item in candidate_items}
-        ranked = [i for i in ranked if i in id_set]
-        ranked.extend([i for i in id_set if i not in ranked])
+        ranked_ids = [i for i in ranked_ids if i in id_set]
+        ranked_ids.extend([i for i in id_set if i not in ranked_ids])
 
-        return ranked
+        return ranked_ids
+
+
+
 
 class MyRecommendationAgent(RecommendationAgent):
     """
-    Full Track2 Recommendation Agent with:
+    Track2 Recommendation Agent:
+    Includes:
     - Planner
-    - PreferenceBuilder (memory-aware)
-    - RankingReasoner (memory-aware)
-    - Flexible memory backend (baseline / enhanced / none)
+    - PreferenceBuilder (optional)
+    - RankingReasoner (with memory)
+    - MemoryDILU
+    And supports ablation switches!
     """
 
     def __init__(
         self,
         llm: LLMBase,
-        memory_type="mydilu",      # "baseline", "mydilu", "none"
+        use_memory=True,
         use_preference_builder=True,
         use_candidate_reviews=True
     ):
         super().__init__(llm=llm)
 
-        # ---------------- Ablation Flags ----------------
+        # ----- Ablation Flags -----
+        self.use_memory = use_memory
         self.use_preference_builder = use_preference_builder
         self.use_candidate_reviews = use_candidate_reviews
-        self.memory_type = memory_type
 
-        # ---------------- Memory Selection ----------------
-        if memory_type == "baseline":
-            self.memory = MemoryDILU(llm=self.llm)
-        elif memory_type == "mydilu":
-            self.memory = MyMemoryDILU(llm=self.llm)
-        elif memory_type == "none":
-            self.memory = None
-        else:
-            self.memory = MyMemoryDILU(llm=self.llm)
+        # ----- Tools / Modules -----
+        self.memory = MemoryDILU(llm=self.llm)
+        self.preference_builder = PreferenceBuilder(llm=self.llm)
 
-        # ---------------- Modules ----------------
-        self.preference_builder = PreferenceBuilder(
-            llm=self.llm,
-            memory=self.memory,
-            use_memory=(self.memory is not None)
-        )
+        # pass memory into reasoner
         self.reasoner = RankingReasoner(
             llm=self.llm,
-            memory=self.memory,
-            use_memory=(self.memory is not None)
+            memory=self.memory if self.use_memory else None,
+            use_memory=self.use_memory
         )
+
         self.planner = MyPlanner(agent=self, llm=self.llm)
 
-        # internal state
+        # internal storage
         self._user_profile = None
         self._user_reviews = None
         self._candidate_items_info = {}
@@ -613,8 +622,9 @@ class MyRecommendationAgent(RecommendationAgent):
         self._history_item_info = {}
 
     # ============================================================
-    #   Helper functions
+    #  Helpers for item info (unchanged)
     # ============================================================
+
     def _compress_item_info(self, item_dict):
         if not isinstance(item_dict, dict):
             return item_dict
@@ -627,9 +637,11 @@ class MyRecommendationAgent(RecommendationAgent):
         ]
 
         compressed = {k: item_dict.get(k) for k in keys if k in item_dict}
+
         desc = compressed.get("description")
         if isinstance(desc, str):
             compressed["description"] = desc[:300]
+
         return compressed
 
     def _get_items_info(self, item_ids):
@@ -652,9 +664,9 @@ class MyRecommendationAgent(RecommendationAgent):
                 reviews = self.interaction_tool.get_reviews(item_id=iid)
                 results[iid] = reviews
 
-                if self.memory is not None:
+                if self.use_memory:
                     for r in reviews:
-                        self.memory("review:" + (r.get("text") or ""))
+                        self.memory("item_review:" + (r.get("text") or ""))
             except Exception:
                 results[iid] = []
         return results
@@ -667,8 +679,9 @@ class MyRecommendationAgent(RecommendationAgent):
         return list(ids)
 
     # ============================================================
-    #   Workflow
+    #  Core workflow
     # ============================================================
+
     def workflow(self):
         task = self.task
         plan = self.planner(task)
@@ -683,9 +696,9 @@ class MyRecommendationAgent(RecommendationAgent):
             elif tool_name == "get_user_reviews":
                 reviews = tool(**args)
                 self._user_reviews = reviews
-                if self.memory is not None:
+                if self.use_memory:
                     for r in reviews:
-                        self.memory("review:" + (r.get("text") or ""))
+                        self.memory("user_review:" + (r.get("text") or ""))
 
             elif tool_name == "get_items_info":
                 self._candidate_items_info = tool(**args)
@@ -695,11 +708,13 @@ class MyRecommendationAgent(RecommendationAgent):
 
             elif tool_name == "build_preference_profile":
                 if not self.use_preference_builder:
+                    # Ablation: skip PB
                     self._preference_profile = {"semantic_categories": {}, "summary": ""}
                     continue
 
-                history_ids = self._extract_user_item_ids(self._user_reviews)
-                self._history_item_info = self._get_items_info(history_ids)
+                # build PB
+                history_item_ids = self._extract_user_item_ids(self._user_reviews)
+                self._history_item_info = self._get_items_info(history_item_ids)
 
                 cleaned_reviews = []
                 for r in self._user_reviews or []:
@@ -730,3 +745,6 @@ class MyRecommendationAgent(RecommendationAgent):
                 )
 
         return []
+
+
+
