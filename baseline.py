@@ -29,7 +29,7 @@ simulator.set_llm(llm_client)
 outputs = simulator.run_simulation(
     number_of_tasks=50, #set to none afterwards
     enable_threading=True,
-    max_workers=5
+    max_workers=10
 )
 
 print("\n==================== RAW OUTPUTS (first 10) ====================")

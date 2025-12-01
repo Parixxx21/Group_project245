@@ -6,7 +6,7 @@ from websocietysimulator.agent.modules.memory_modules import MemoryDILU
 
 import json
 import re
-
+import math
 
 class MyPlanner(PlanningBase):
     """
@@ -507,15 +507,22 @@ class MySimulationAgent(SimulationAgent):
 
         # toggles
         self.enable_memory = True
-        self.enable_reflection = False
+        self.enable_reflection = True
 
     # ---------------------------------------------------
     # Step 5: analyze item ratings
     # ---------------------------------------------------
+    import math
+
     def _analyze_item_ratings(self):
-        """Compute mean rating using item reviews."""
+        """Compute mean rating, count, variance, and std."""
         if not hasattr(self, "_item_reviews") or not self._item_reviews:
-            self._item_stats = {"mean_rating": None, "count": 0}
+            self._item_stats = {
+                "mean_rating": None,
+                "count": 0,
+                "variance": None,
+                "std": None,
+            }
             return self._item_stats
 
         scores = []
@@ -526,15 +533,30 @@ class MySimulationAgent(SimulationAgent):
             except:
                 pass
 
-        if scores:
-            mean_rating = sum(scores) / len(scores)
-            count = len(scores)
-        else:
-            mean_rating = None
-            count = 0
+        if not scores:
+            self._item_stats = {
+                "mean_rating": None,
+                "count": 0,
+                "variance": None,
+                "std": None,
+            }
+            return self._item_stats
 
-        self._item_stats = {"mean_rating": mean_rating, "count": count}
+        mean_rating = sum(scores) / len(scores)
+        count = len(scores)
+
+        # variance (population)
+        variance = sum((x - mean_rating)**2 for x in scores) / len(scores)
+        std = math.sqrt(variance)
+
+        self._item_stats = {
+            "mean_rating": mean_rating,
+            "count": count,
+            "variance": variance,
+            "std": std,
+        }
         return self._item_stats
+
 
     # ---------------------------------------------------
     # Step 7: memory + similar reviews
@@ -570,7 +592,6 @@ class MySimulationAgent(SimulationAgent):
         user_reviews = getattr(self, "_user_reviews", [])
         item_reviews = getattr(self, "_item_reviews", [])
 
-        # --- USER EXAMPLES (longest user reviews: style signal) ---
         sorted_user = sorted(
             user_reviews,
             key=lambda r: len(r.get("text", "")),
@@ -578,7 +599,6 @@ class MySimulationAgent(SimulationAgent):
         )
         user_examples = [r.get("text", "") for r in sorted_user[:3]]
 
-        # --- ITEM EXAMPLES (closest to expected rating: topic signal) ---
         target = None
         if hasattr(self, "_groundtruth"):
             target = self._groundtruth.get("stars")
@@ -601,46 +621,51 @@ class MySimulationAgent(SimulationAgent):
         return self._similar_reviews_struct
 
     
+    import math
+
     def _smooth_rating(self, llm_rating):
         user_reviews = getattr(self, "_user_reviews", [])
-        item_stats = getattr(self, "_item_stats", {"mean_rating": 4.0})
+        item_stats = getattr(self, "_item_stats", {"mean_rating": 4.0, "std": 1.0})
         persona = getattr(self, "_persona_json", {})
 
-        # user mean
         if user_reviews:
             scores = [float(r.get("stars", r.get("rating", 3))) for r in user_reviews]
             user_mean = sum(scores) / len(scores)
+            user_var = sum((x - user_mean) ** 2 for x in scores) / len(scores)
+            user_std = math.sqrt(user_var)
         else:
             user_mean = 4.0
+            user_std = 1.0  # fallback: moderate uncertainty
 
-        # item mean
         item_mean = item_stats.get("mean_rating", 4.0)
+        item_std = item_stats.get("std", 1.0)
 
-        # persona tendency
         tendency = persona.get("rating_behavior", {}).get("tendency", "neutral")
 
         # expected rating
         expected = 0.5 * user_mean + 0.5 * item_mean
 
-        # smoothing
-        alpha = 0.65
+        # std 越大 smoothing 越弱
+        lambda_item = 1 / (1 + item_std)
+        lambda_user = 1 / (1 + user_std)
+        # combine (simple average)
+        alpha = 0.5 * lambda_item + 0.5 * lambda_user
+
+        alpha = max(0.25, min(alpha, 0.85))
+
         smoothed = alpha * llm_rating + (1 - alpha) * expected
 
-        # persona boundaries
         if tendency == "harsh":
-            smoothed = min(smoothed, user_mean + 0.4)
+            smoothed = min(smoothed, user_mean + 0.3)
         elif tendency == "generous":
-            smoothed = max(smoothed, user_mean - 0.4)
+            smoothed = max(smoothed, user_mean - 0.3)
 
-        # clamp + round
         smoothed = max(1.0, min(5.0, smoothed))
         smoothed = round(smoothed * 2) / 2
         return smoothed
 
 
-    # ---------------------------------------------------
-    # FULL WORKFLOW EXECUTION
-    # ---------------------------------------------------
+
     def workflow(self):
         task = self.task
         plan = self.planner(task)
@@ -744,7 +769,7 @@ class MySimulationAgent(SimulationAgent):
                     context,
                     self._item_info,
                 )
-                draft["stars"] = self._smooth_rating(draft["stars"])
+                #draft["stars"] = self._smooth_rating(draft["stars"])
                 self._draft = draft
 
             # ---------------------------------------------------
@@ -764,11 +789,13 @@ class MySimulationAgent(SimulationAgent):
                     item_stats=self._item_stats,
                 )
 
-                return self.reasoner.reflection(
+                final = self.reasoner.reflection(
                     context,
                     self._draft,
                     self._item_info,
                 )
+                final["stars"] = self._smooth_rating(final["stars"])
+                return final
 
         # fallback
         return {"stars": 0.0, "review": ""}
