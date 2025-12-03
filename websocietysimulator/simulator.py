@@ -333,9 +333,10 @@ class Simulator:
         )
 
         return {
-            'type': 'recommendation',
+            'type': 'simulation',
             'metrics': metrics.__dict__,
         }
+
 
     def _evaluate_simulation(self, ground_truth_data: List[Dict]) -> Dict[str, Any]:
         """
