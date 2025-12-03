@@ -37,6 +37,14 @@ class SimulationMetrics:
     preference_estimation: float
     review_generation: float
     overall_quality: float
+    sentiment_error: float
+    emotion_error: float
+    topic_error: float
+
+    star_mae: float
+    star_mse: float
+    star_rmse: float
+
 
 class BaseEvaluator:
     """Base class for evaluation tools"""
@@ -146,6 +154,22 @@ class SimulationEvaluator(BaseEvaluator):
         star_error = star_error / len(real_stars)
         preference_estimation = 1 - star_error
 
+        clipped_stars = []
+        for s in simulated_stars:
+            if s > 5:
+                s = 5
+            elif s < 0:
+                s = 0
+            clipped_stars.append(s)
+
+        # compute absolute and squared errors
+        abs_errors = [abs(s - r) for s, r in zip(clipped_stars, real_stars)]
+        sq_errors = [(s - r) ** 2 for s, r in zip(clipped_stars, real_stars)]
+
+        star_mae = float(np.mean(abs_errors))
+        star_mse = float(np.mean(sq_errors))
+        star_rmse = float(np.sqrt(star_mse))
+
         # Calculate review metrics
         simulated_reviews = [item['review'] for item in simulated_data]
         real_reviews = [item['review'] for item in real_data]
@@ -163,7 +187,13 @@ class SimulationEvaluator(BaseEvaluator):
         metrics = SimulationMetrics(
             preference_estimation=preference_estimation,
             review_generation=review_generation,
-            overall_quality=overall_quality
+            overall_quality=overall_quality,
+            sentiment_error=sentiment_error,
+            emotion_error=emotion_error,
+            topic_error=topic_error,
+            star_mse=star_mse,
+            star_mae=star_mae,
+            star_rmse=star_rmse
         )
 
         self.save_metrics(metrics)
