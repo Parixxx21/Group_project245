@@ -15,7 +15,7 @@ import json
 
 
 ###########################################################
-# 0. (Optional) Mock LLM for quick local testing
+# 0. Mock LLM for quick local testing
 ###########################################################
 class MockLLM:
     def __call__(
@@ -36,7 +36,9 @@ class MockLLM:
 ###########################################################
 def _extract_rating_from_review(review: Dict[str, Any]) -> Optional[float]:
     """
-    兼容多种字段名（Yelp/Amazon/Goodreads）:
+    Extract a numeric rating from a review JSON.
+
+    We support multiple field names across Yelp/Amazon/Goodreads:
     - stars / rating / overall / score
     """
     for key in ["stars", "rating", "overall", "score"]:
@@ -63,9 +65,10 @@ def compute_rating_stats(
     user_reviews: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """
-    统计 item 和 user 的打分行为，用来做：
-    - prompt 中的“背景信息”
-    - 后处理中的“星级校准”，帮助降低 star_mae
+    Compute rating statistics for the item and the user.
+
+    These statistics are used both as background information in the prompt
+    and later for numeric star calibration to reduce star_mae.
     """
     item_ratings = _collect_ratings(item_reviews)
     user_ratings = _collect_ratings(user_reviews)
@@ -104,13 +107,14 @@ def compute_rating_stats(
 
 
 ###########################################################
-# 2. MemoryDILU wrapper with explicit retrive/add methods
+# 2. MemoryDILU wrapper with explicit retrieve/add methods
 ###########################################################
 class MemoryDILU(MemoryBase):
     """
-    轻量封装一下 MemoryBase：
-    - retriveMemory(query_scenario): 从 scenario_memory 里做相似搜索
-    - addMemory(current_situation): 往 scenario_memory 里写入一条轨迹
+    Lightweight wrapper around MemoryBase.
+
+    - retriveMemory(query_scenario): perform similarity search over scenario_memory
+    - addMemory(current_situation): insert a trajectory into scenario_memory
     """
 
     def __init__(self, llm: LLMBase):
@@ -148,8 +152,11 @@ class MemoryDILU(MemoryBase):
 ###########################################################
 class MyPlanner(PlanningBase):
     """
-    这里只返回一个静态 plan，主要是为了让整体结构清晰，
-    方便以后扩展（不会额外消耗 LLM 调用）。
+    Planner module.
+
+    Returns a static multi-step plan for clarity and extensibility.
+    This makes the pipeline structure explicit without incurring
+    extra LLM calls for planning.
     """
 
     def __init__(self, llm: LLMBase):
@@ -255,7 +262,7 @@ class MyRetriever:
 
     def store_reviews(self, reviews: List[Dict[str, Any]], type: str) -> None:
         """
-        把 item / user 的 reviews 存进 retriever（以及可选的 memory）
+        Store item/user reviews in the retriever (and optionally in memory).
         """
         if type == "items":
             for rv in reviews:
@@ -279,13 +286,17 @@ class MyRetriever:
             texts = [texts]
         return self.model.encode(texts, convert_to_tensor=True)
 
-    # ---------- 基于本地 embedding 的检索 ----------
+    # ---------- Local embedding-based retrieval ----------
     def get_top_k_user_reviews(
         self,
         user_reviews: List[Dict[str, Any]],
         item_title: str,
         k: int = 3,
     ) -> List[str]:
+        """
+        Retrieve the top-k user reviews whose text is most similar to the item title
+        using a local embedding model.
+        """
         if not user_reviews or not item_title:
             return []
 
@@ -301,7 +312,7 @@ class MyRetriever:
 
         return [review_texts[i] for i in topk_idx]
 
-    # ---------- 从 MemoryDILU 里取用户评论 ----------
+    # ---------- Retrieve user reviews from MemoryDILU ----------
     def get_top_k_user_reviews_from_memory(self, item_title: str, k: int = 3) -> List[str]:
         if self.user_mem is None:
             return []
@@ -319,7 +330,7 @@ class MyRetriever:
 
         return results[:k]
 
-    # ---------- 从 MemoryDILU 里取 item 评论 ----------
+    # ---------- Retrieve item reviews from MemoryDILU ----------
     def get_top_k_item_reviews_from_memory(self, item_title: str, k: int = 3) -> List[str]:
         if self.item_mem is None:
             return []
@@ -337,8 +348,10 @@ class MyRetriever:
 
     def get_item_key_features(self, item: Dict[str, Any]) -> str:
         """
-        从 item/business JSON 中抽取关键信息
-        兼容 Amazon / Yelp / Goodreads，不存在的字段会自动跳过
+        Extract key fields from the item/business JSON.
+
+        We handle Amazon / Yelp / Goodreads style JSON.
+        Missing fields are simply skipped.
         """
         fields = [
             "title",
@@ -364,14 +377,17 @@ class MyRetriever:
         k: int = 3,
     ) -> List[str]:
         """
-        选几条 "other reviews for this business" 作为 topic anchor。
-        优先用本地 reviews，memory 作为补充。
+        Select a few "other reviews for this business" as topical anchors.
+
+        We first use local item reviews, and then fall back to MemoryDILU
+        if we need more examples.
         """
         texts = [rv.get("text", "") for rv in item_reviews if rv.get("text")]
         anchors: List[str] = []
 
         if texts:
-            # 简单拿前几条即可；也可以改成 embedding top-k
+            # For simplicity, just take the first few reviews.
+            # (This could be replaced by embedding-based top-k if needed.)
             anchors.extend(texts[:k])
 
         if len(anchors) < k and self.item_mem is not None:
@@ -387,10 +403,12 @@ class MyRetriever:
         item_reviews: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
-        汇总检索结果给 Reasoner 使用：
-        - similar_user_reviews: 同一用户历史上和当前 item 相近的评论
-        - similar_item_reviews: 该 business 上的其他评论（topic anchor）
-        - item_features: item/business 结构化信息
+        Gather retrieval results for the reasoner:
+
+        - similar_user_reviews: historical reviews by the same user that are
+          semantically close to the current item.
+        - similar_item_reviews: other reviews for this item/business (topic anchors).
+        - item_features: structured item/business information.
         """
         item_title = item.get("title", "") or item.get("name", "")
 
@@ -435,9 +453,11 @@ class PersonaBuilder:
         user_reviews: List[str],
     ) -> str:
         """
-        调用 LLM，根据用户 profile + 历史评论，总结出 persona（JSON 字符串）
+        Call the LLM to summarize a persona from user profile + historical reviews.
+
+        The persona is returned as a JSON-formatted string.
+        We assume user_reviews have already been truncated upstream.
         """
-        # 这里假定在外层已经截断过 user_reviews，不再做复杂控制
         prompt = f"""
 You are analyzing an Amazon/Yelp/Goodreads user's behavior and writing style to construct a DETAILED persona.
 
@@ -488,12 +508,27 @@ Extract the user's behavior in 5 dimensions and return ONLY a JSON dictionary:
 # 6. Reasoner (rating + review generation)
 ###########################################################
 class MyReasoner:
-    MAX_PROMPT_CHARS = 15000  # 粗略限制，防止超过 16k token
+    """
+    Reasoner module.
+
+    Besides generating the final rating and review, this module also
+    performs the *second stage* of context gathering:
+    - aggregates rating statistics into a textual rating context;
+    - injects domain hints and inferred user expertise;
+    - merges persona JSON, retrieved user/item reviews, and item metadata
+      into a single structured prompt (with truncation to fit context limits).
+
+    High-level data loading happens in `MySimulationAgent.workflow`,
+    while prompt-level context assembly and single-call CoT reasoning
+    happen here in `generate_review`.
+    """
+
+    MAX_PROMPT_CHARS = 15000  # coarse limit, to avoid exceeding the model's context
 
     def __init__(self, llm: LLMBase):
         self.llm = llm
 
-    # ---------- 解析 LLM 输出 ----------
+    # ---------- Parse LLM output ----------
     def _extract_results(self, text: str) -> Optional[Dict[str, Any]]:
         stars_match = re.search(r"stars:\s*([0-9.]+)", text)
         review_match = re.search(r"review:\s*(.*)", text, re.DOTALL)
@@ -513,8 +548,10 @@ class MyReasoner:
 
     def _calibrate_stars(self, stars: float, rating_stats: Dict[str, Any]) -> float:
         """
-        - 先和 item 的历史平均做一个平滑
-        - 再根据 user 的平均分加一点偏置
+        Calibrate the LLM-predicted rating using rating statistics.
+
+        - Smooth toward the item's historical mean rating.
+        - Apply a small bias based on the user's average rating.
         """
         item_mean = rating_stats.get("item_mean")
         user_mean = rating_stats.get("user_mean")
@@ -531,17 +568,17 @@ class MyReasoner:
         final = round(final * 2) / 2.0
         return final
 
-    # ---------- domain / expertise 推断 ----------
+    # ---------- Domain / expertise inference ----------
     def infer_domain(self, item_info: Dict[str, Any]) -> str:
         txt = str(item_info).lower()
 
-        # Yelp 典型领域
+        # Typical Yelp domains
         if any(k in txt for k in ["restaurant", "cafe", "coffee", "bar", "bistro", "diner", "pizza", "burger"]):
             return "restaurant"
         if any(k in txt for k in ["hotel", "inn", "resort", "motel"]):
             return "hotel"
 
-        # Amazon 常见品类
+        # Common Amazon categories
         if any(k in txt for k in ["xbox", "ps5", "switch", "steam", "video game", "gaming"]):
             return "video_games"
         if any(k in txt for k in ["guitar", "piano", "violin", "instrument"]):
@@ -602,7 +639,7 @@ class MyReasoner:
             )
         return ""
 
-    # ---------- 将“预期星级”映射到情绪强度 ----------
+    # ---------- Map expected rating to sentiment band ----------
     def _sentiment_label(self, expected_star: float) -> str:
         if expected_star >= 4.5:
             return "strongly positive"
@@ -627,10 +664,22 @@ class MyReasoner:
         similar_reviews: Dict[str, Any],
         rating_stats: Dict[str, Any],
     ) -> Dict[str, Any]:
+        """
+        Single-call CoT reasoning for one (user, item) pair.
+
+        This method:
+        - gathers and formats all contextual signals (persona, domain, rating stats,
+          retrieved reviews, item metadata);
+        - constructs a structured prompt with explicit rules;
+        - calls the LLM once to jointly produce rating + review;
+        - calibrates the rating using rating_stats.
+        """
+        # ---- Context gathering (semantic/domain level) ----
         domain = self.infer_domain(item_info)
         expertise = self.infer_user_expertise(persona_json, domain)
         domain_guidance = self._domain_guidance(domain)
 
+        # ---- Context gathering (numeric rating priors) ----
         user_tendency = rating_stats.get("user_tendency", "unknown")
         item_mean = rating_stats.get("item_mean")
         item_review_count = rating_stats.get("item_review_count", 0)
@@ -652,17 +701,17 @@ class MyReasoner:
             "\n".join(rating_context_lines) if rating_context_lines else "No strong prior rating signals."
         )
 
-        # 预估一个“期望星级”，用来控制情绪强度
+        # Estimate an "expected" star level to choose the target sentiment band.
         expected_star = item_mean if item_mean is not None else (user_mean or 3.8)
         sentiment_label = self._sentiment_label(expected_star)
 
-        # 处理 similar_reviews 结构
+        # ---- Context gathering (retrieved examples) ----
         similar_user_reviews = similar_reviews.get("similar_user_reviews") or similar_reviews.get(
             "similar_reviews", []
         )
         similar_item_reviews = similar_reviews.get("similar_item_reviews", [])
 
-        # 截断以避免 context 过长
+        # ---- Context gathering (prompt construction & truncation) ----
         persona_str = self._truncate(str(persona_json), 6000)
         user_profile_str = self._truncate(str(user_profile), 2000)
         item_info_str = self._truncate(str(item_info), 2500)
@@ -670,7 +719,7 @@ class MyReasoner:
         sim_item_str = self._truncate(str(similar_item_reviews), 2500)
         rating_context_str = self._truncate(rating_context, 1000)
 
-        # 构造 prompt
+        # ---- Final prompt assembly (single-call CoT reasoning) ----
         prompt = f"""
 You are simulating a human user writing a product/business review.
 
@@ -729,7 +778,7 @@ No extra commentary.
 """
         response = self.llm(
             messages=[{"role": "user", "content": prompt[: self.MAX_PROMPT_CHARS]}],
-            temperature=0.2,  # 略微降低温度，提升稳定性
+            temperature=0.2,  # slightly lower temperature for more stable outputs
             max_tokens=350,
         )
 
@@ -740,7 +789,7 @@ No extra commentary.
             parsed["stars"] = calibrated_stars
             return parsed
 
-        # fallback
+        # Fallback if parsing fails.
         fallback_stars = self._calibrate_stars(4.0, rating_stats)
         return {
             "stars": fallback_stars,
@@ -753,6 +802,12 @@ No extra commentary.
 ###########################################################
 class OutputController:
     def parse(self, output: Any) -> Dict[str, Any]:
+        """
+        Normalize the final output into a {stars, review} dictionary.
+
+        - Stars are clamped to [1, 5] and quantized to 0.5 increments.
+        - Review text is truncated to 512 characters.
+        """
         if isinstance(output, dict):
             stars = float(output.get("stars", 4.0))
             stars = min(5.0, max(1.0, stars))
@@ -787,18 +842,25 @@ class OutputController:
 ###########################################################
 class MySimulationAgent(SimulationAgent):
     """
-    Pipeline 概览（对应你画的图）：
+    End-to-end simulation agent.
 
-    Planning → Context Gathering → Rating Stats Analyzing →
-    Memory Retrieval + Domain-focus guidance →
-    Persona Build → CoT Review Generation →
-    Stats-based output adjustment → Generation
+    Pipeline overview (corresponding to the workflow figure):
+
+        Planning → High-level Context Gathering → Rating Stats Analysis →
+        Memory Retrieval + Domain-focused guidance →
+        Persona Build → Single-call CoT Review Generation →
+        Stats-based output adjustment.
+
+    High-level data loading and truncation happen in `workflow()`,
+    while prompt-level context assembly and CoT reasoning happen
+    inside `MyReasoner.generate_review()`.
     """
 
     def __init__(self, llm: LLMBase):
         super().__init__(llm)
         self.enable_memory = True
 
+        # Initialize optional long-term memory modules if the LLM supports embeddings.
         if hasattr(self.llm, "get_embedding_model") and self.enable_memory:
             self.user_mem = MemoryDILU(llm=self.llm)
             self.item_mem = MemoryDILU(llm=self.llm)
@@ -813,23 +875,36 @@ class MySimulationAgent(SimulationAgent):
         self.controller = OutputController()
 
     def workflow(self) -> Dict[str, Any]:
-        task = self.task  # dict (SimulationTask.to_dict())
-        _plan = self.planner(task)  # 目前只是为了结构完整，不强制逐步执行
+        """
+        Single end-to-end call for one (user, item) pair.
 
-        # --------- 1. 通过 InteractionTool 拿数据 ---------
+        This function performs the *high-level* context gathering:
+        - fetch user profile, item info, and historical reviews via InteractionTool;
+        - compute rating statistics;
+        - populate retriever/memory with raw reviews;
+        - construct a truncated list of user reviews for persona building.
+
+        It then delegates prompt-level context assembly and CoT reasoning
+        to `MyReasoner.generate_review`, and finally normalizes the output
+        with the OutputController.
+        """
+        task = self.task  # dict (SimulationTask.to_dict())
+        _plan = self.planner(task)  # currently used only to keep the pipeline structure explicit
+
+        # --------- 1. Fetch data via InteractionTool ---------
         user = self.interaction_tool.get_user(task["user_id"])
         item = self.interaction_tool.get_item(task["item_id"])
         item_reviews = self.interaction_tool.get_reviews(item_id=task["item_id"])
         user_reviews = self.interaction_tool.get_reviews(user_id=task["user_id"])
 
-        # --------- 2. 统计 rating 行为 ---------
+        # --------- 2. Compute rating statistics ---------
         rating_stats = compute_rating_stats(item_reviews, user_reviews)
 
-        # --------- 3. 存入 retriever / memory ---------
+        # --------- 3. Store reviews in retriever / memory ---------
         self.retriever.store_reviews(item_reviews, type="items")
         self.retriever.store_reviews(user_reviews, type="user")
 
-        # --------- 4. 检索相似评论 & item 特征 ---------
+        # --------- 4. Retrieve similar reviews & item features ---------
         if user_reviews or item_reviews:
             similar_info = self.retriever.retrieve(
                 user_reviews=user_reviews,
@@ -843,9 +918,9 @@ class MySimulationAgent(SimulationAgent):
                 "item_features": "",
             }
 
-        # --------- 5. 构建 persona（对 user_reviews 做截断，避免 context 溢出） ---------
+        # --------- 5. Build persona (truncating user_reviews to avoid overflow) ---------
         user_review_texts = [rv.get("text", "") for rv in user_reviews if rv.get("text")]
-        # 最多 30 条，每条最多 300 字符
+        # At most 30 reviews, each truncated to 300 characters.
         compact_user_reviews = [txt[:300] for txt in user_review_texts[:30]]
 
         try:
@@ -859,7 +934,7 @@ class MySimulationAgent(SimulationAgent):
             print("→ Using empty persona and continuing...\n")
             persona_json = "{}"
 
-        # --------- 6. Reasoner 生成评分 + 评论 ---------
+        # --------- 6. Reasoner: generate rating + review ---------
         raw_output = self.reasoner.generate_review(
             persona_json=persona_json,
             user_profile=user,
@@ -868,6 +943,6 @@ class MySimulationAgent(SimulationAgent):
             rating_stats=rating_stats,
         )
 
-        # --------- 7. 输出控制 ---------
+        # --------- 7. Output control & normalization ---------
         result = self.controller.parse(raw_output)
         return result
